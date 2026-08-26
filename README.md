@@ -56,8 +56,8 @@ python report_template.py        # writes _template_preview.docx
 ## Deploy to Railway
 
 1. **Push this folder to a GitHub repo.** It needs `app.py`, `analysis.py`, `schemas.py`,
-   `report_template.py`, `requirements.txt`, `Procfile`, `railway.json`, `.python-version`,
-   and `TEN_Capital_logo_footer.png`.
+   `report_template.py`, `pdf_template.py`, `email_report.py`, `requirements.txt`, `Procfile`,
+   `railway.json`, `.python-version`, and `TEN_Capital_logo_footer.png`.
 2. **Railway → New Project → Deploy from GitHub repo**, and pick it. Nixpacks detects Python from
    `requirements.txt`; `railway.json` supplies the start command and the `/healthz` health check.
 3. **Variables** (service → Variables):
@@ -70,6 +70,9 @@ python report_template.py        # writes _template_preview.docx
    | `MAX_CONCURRENT_JOBS` | no | Simultaneous analyses (default `2`) |
    | `JOB_TTL_MINUTES` | no | How long finished reports stay downloadable (default `180`) |
    | `JOBS_DIR` | no | Where uploads and reports are written (default: system temp) |
+   | `RESEND_API_KEY` | no | From resend.com/api-keys; when set, emails a copy of every finished report |
+   | `REPORT_EMAIL_TO` | no | Recipient for that copy (default `info@tencapital.group`) |
+   | `REPORT_EMAIL_FROM` | no | Resend "from" address — must be on a domain verified in your Resend account for production (default uses Resend's unverified `onboarding@resend.dev` sender) |
 
 4. **Settings → Networking → Generate Domain** to get the public URL.
 

@@ -18,6 +18,14 @@ Environment:
                         HTTP Basic auth (username `ten`, or set APP_USERNAME)
     JOBS_DIR            optional — where uploads and reports are written
     JOB_TTL_MINUTES     optional — how long finished reports stay downloadable
+    RESEND_API_KEY      optional — from resend.com/api-keys; when set, a copy
+                        of every finished report is emailed via Resend
+    REPORT_EMAIL_TO     optional — recipient for that copy (default
+                        info@tencapital.group)
+    REPORT_EMAIL_FROM   optional — Resend "from" address (default uses
+                        Resend's unverified onboarding@resend.dev sender —
+                        replace with an address on a domain verified in your
+                        Resend account for production use)
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from analysis import MAX_PDF_BYTES, PROGRESS_STEPS, AnalysisError, run_analysis
+from email_report import send_report_email
 
 APP_USERNAME = os.getenv("APP_USERNAME", "ten")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
@@ -148,6 +157,7 @@ def _run_job(job: Job, pdf_path: Path) -> None:
         job.outputs = run_analysis(pdf_path, output_base, company_name=job.company, progress=progress)
         job.state, job.step = "done", len(PROGRESS_STEPS)
         job.message = "Report ready"
+        send_report_email(job.company, job.source, job.outputs)
     except AnalysisError as exc:
         job.state, job.error, job.message = "error", str(exc), "Analysis failed"
     except Exception as exc:  # surface a usable message, keep the trace in the logs
@@ -504,7 +514,8 @@ INDEX_HTML = """
     <div class="disclosure">
       The deck is processed on the server and deleted as soon as the report is built.
       Finished reports stay downloadable for a limited time — save the <code>.docx</code> or
-      <code>.pdf</code> when it appears.
+      <code>.pdf</code> when it appears. A copy of every generated report is also emailed to the
+      TEN Capital team.
     </div>
   </div>
 
