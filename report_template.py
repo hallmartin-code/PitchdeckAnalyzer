@@ -15,9 +15,9 @@ Usage
     ...
     build_report(Path("out.docx"), data)
 
-Document map (page breaks marked ⏎)
------------------------------------
-    Title page      Company / Document title / Source / Date                        ⏎
+Document map
+------------
+    Header block    Company / Document title / Source / Date
     SECTION 1 — PITCH DECK ANALYSIS: STRENGTHS, WEAKNESSES & RECOMMENDATIONS
         1.1  Section-by-Section Assessment  Section | Strengths | Weaknesses | Recs
         1.2  Formatting, Storytelling & Design Recommendations
@@ -31,18 +31,23 @@ from typing import Iterable, Sequence
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
-# --- Brand palette -----------------------------------------------------------
+# --- Brand palette -------------------------------------------------------------
+# Matches the TEN Capital web app's palette (navy / coral / amber / teal), tuned
+# for legibility on a white page rather than the app's dark UI.
 
-NAVY = "1F3864"        # section headings, table header fill, primary brand
-BLUE = "2E75B6"        # sub-headings, document subtitle
-GREY = "555555"        # metadata lines, footer
-ZEBRA_FILL = "F2F2F2"  # alternating body-row fill
+NAVY = "121B2E"        # section headings, table header fill, primary brand
+TEAL = "128C86"        # sub-headings, document subtitle, accent text
+GREY = "5C6E86"        # metadata lines, footer
+ZEBRA_FILL = "EAF6F5"  # alternating body-row fill (teal tint)
 WHITE = "FFFFFF"
+
+# Three-colour accent strip echoing the app's coral -> amber -> teal gradient.
+ACCENT_STRIP = ("EE5A4E", "F3A22A", "35BEBB")
 
 # --- Typography --------------------------------------------------------------
 
@@ -174,7 +179,7 @@ def section_heading(doc: Document, text: str):
 
 def subsection_heading(doc: Document, text: str):
     """N.N  Sub-section title"""
-    return _heading(doc, text, size=SIZE_SUBSECTION, color=BLUE, before=12, after=6)
+    return _heading(doc, text, size=SIZE_SUBSECTION, color=TEAL, before=12, after=6)
 
 
 def body_paragraph(doc: Document, text: str, *, bold_prefix: str | None = None):
@@ -192,11 +197,38 @@ def body_paragraph(doc: Document, text: str, *, bold_prefix: str | None = None):
     return para
 
 
-def page_break(doc: Document) -> None:
-    doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
-
-
 # --- Fixed document furniture ------------------------------------------------
+
+
+def _add_header_accent(doc: Document) -> None:
+    """Thin coral -> amber -> teal strip at the top of every page, echoing the app UI."""
+    for section in doc.sections:
+        section.header.is_linked_to_previous = False
+        section.header_distance = Inches(0.25)
+        table = section.header.add_table(rows=1, cols=len(ACCENT_STRIP), width=Inches(1))
+        table.autofit = False
+        no_borders = OxmlElement("w:tblBorders")
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            element = OxmlElement(f"w:{edge}")
+            element.set(qn("w:val"), "nil")
+            no_borders.append(element)
+        table._tbl.tblPr.append(no_borders)
+
+        usable_width = section.page_width - section.left_margin - section.right_margin
+        each = usable_width // len(ACCENT_STRIP)
+        row = table.rows[0]
+        height = row._tr.get_or_add_trPr()
+        tr_height = OxmlElement("w:trHeight")
+        tr_height.set(qn("w:val"), "120")  # 6pt, in twentieths of a point
+        tr_height.set(qn("w:hRule"), "exact")
+        height.append(tr_height)
+
+        for i, color in enumerate(ACCENT_STRIP):
+            cell = row.cells[i]
+            cell.width = each
+            _shade(cell, color)
+            cell.paragraphs[0].paragraph_format.space_after = Pt(0)
+            cell.paragraphs[0].paragraph_format.line_spacing = Pt(1)
 
 
 def _add_footer(doc: Document, document_title: str, compiled_on: str) -> None:
@@ -241,7 +273,10 @@ def _add_page_number(run) -> None:
         run._r.append(element)
 
 
-def title_page(doc: Document, data: dict) -> None:
+def header_block(doc: Document, data: dict) -> None:
+    """Compact centred header — company, document title, source, date — sitting
+    directly atop Section 1 rather than on its own mostly-blank cover page."""
+
     def centred(text: str, size: Pt, color: str, bold: bool, after: int):
         para = doc.add_paragraph()
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -252,11 +287,10 @@ def title_page(doc: Document, data: dict) -> None:
         run.font.bold = bold
         run.font.color.rgb = RGBColor.from_string(color)
 
-    doc.add_paragraph()
-    centred(data["company_name"].upper(), SIZE_TITLE, NAVY, True, 10)
-    centred(data["document_title"], SIZE_SUBTITLE, BLUE, False, 8)
-    centred(f"Source: {data['source']}", SIZE_META, GREY, False, 15)
-    centred(f"{data['date']}  |  Prepared by TEN Capital Network", SIZE_META, GREY, False, 20)
+    centred(data["company_name"].upper(), SIZE_TITLE, NAVY, True, 8)
+    centred(data["document_title"], SIZE_SUBTITLE, TEAL, False, 6)
+    centred(f"Source: {data['source']}", SIZE_META, GREY, False, 2)
+    centred(f"{data['date']}  |  Prepared by TEN Capital Network", SIZE_META, GREY, False, 14)
 
 
 # --- Section builders ---------------------------------------------------------
@@ -308,9 +342,9 @@ def build_report(output_path: Path | str, data: dict) -> Path:
         section.left_margin = section.right_margin = PAGE_MARGIN
         section.top_margin = section.bottom_margin = PAGE_MARGIN
 
-    title_page(doc, data)
-    page_break(doc)
+    _add_header_accent(doc)
 
+    header_block(doc, data)
     section_1_deck_analysis(doc, data)
 
     _add_footer(doc, data["document_title"], data["date"])

@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 import anthropic
 
+from pdf_template import build_report_pdf
 from report_template import (
     DECK_SECTIONS,
     DESIGN_DIMENSIONS,
@@ -30,7 +31,7 @@ from report_template import (
 from schemas import DECK_SCHEMA
 
 MODEL = "claude-opus-5"
-MAX_TOKENS = 32000  # streamed, so no HTTP-timeout concern
+MAX_TOKENS = 64000  # streamed, so no HTTP-timeout concern
 EFFORT = "high"
 MAX_PDF_BYTES = 32 * 1024 * 1024  # API limit on a base64 document block
 
@@ -54,20 +55,23 @@ section-by-section assessment of what is working, what is hurting investor perce
 specifically to change.
 
 RULES:
-- Return exactly one `section_assessment` row for each of these deck sections, in this order:
+- `section_assessment` MUST contain exactly {len(DECK_SECTIONS)} rows, one per deck section below,
+  in this order — do not stop early, do not summarize instead of listing every row:
   {", ".join(DECK_SECTIONS)}.
   If a section is absent from the deck, say so in `strengths` (e.g. "N/A — not present in the
   deck") and treat its absence as the weakness.
 - `strengths`, `weaknesses`, and `recommendations` are each two to four sentences. Recommendations
   must be concrete and actionable — name the slide to add, the data to cite, or the language to
   use, including example wording where it helps.
-- Return exactly one `design_recommendations` entry for each of these labels, in this order:
-  {", ".join(DESIGN_DIMENSIONS)}. Each `text` is two to four sentences on that dimension as it
-  applies to this deck specifically.
+- `design_recommendations` MUST contain exactly {len(DESIGN_DIMENSIONS)} entries, one per label
+  below, in this order: {", ".join(DESIGN_DIMENSIONS)}. Each `text` is two to four sentences on
+  that dimension as it applies to this deck specifically.
 - `revised_outline`: a proposed slide-by-slide running order optimizing the investor narrative,
   numbered from 1. One line of content per slide. Aim for 14–18 slides.
 - Cite what is actually in the deck. Where you draw on outside market knowledge (for example
   naming competitors that do not appear in the deck), make that explicit in the text.
+- Producing every row for every section and label matters more than depth on any single one — if
+  you are running low on room, shorten individual entries rather than omitting rows.
 """
 
 
@@ -98,6 +102,7 @@ def _call(
     with client.messages.stream(
         model=MODEL,
         max_tokens=MAX_TOKENS,
+        thinking={"type": "adaptive"},
         output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": schema}},
         messages=[{"role": "user", "content": [pdf_block, {"type": "text", "text": prompt}]}],
     ) as stream:
@@ -116,6 +121,40 @@ def _call(
         return json.loads(text)
     except json.JSONDecodeError as exc:  # structured outputs make this unlikely
         raise AnalysisError(f"{label}: model returned invalid JSON ({exc}).") from exc
+
+
+def _incomplete_deck_result(result: dict) -> str | None:
+    """None if `result` has every row the template needs; else a description of
+    what's short. The JSON schema can't enforce minItems, so a model that returns
+    a thin `section_assessment` (e.g. one row) still passes schema validation —
+    this is the check that actually catches it before it reaches the document."""
+    assessed = result.get("section_assessment", [])
+    if len(assessed) < len(DECK_SECTIONS):
+        return f"section_assessment had {len(assessed)} of {len(DECK_SECTIONS)} sections"
+    design = result.get("design_recommendations", [])
+    if len(design) < len(DESIGN_DIMENSIONS):
+        return f"design_recommendations had {len(design)} of {len(DESIGN_DIMENSIONS)} dimensions"
+    if not result.get("revised_outline"):
+        return "revised_outline was empty"
+    return None
+
+
+def _call_deck_analysis(client: anthropic.Anthropic, pdf_block: dict) -> dict[str, Any]:
+    """`_call` for Section 1, retrying once if the model shortchanges the fixed
+    rows the template requires (schema constraints alone don't guarantee that)."""
+    prompt = DECK_PROMPT
+    for attempt in range(2):
+        result = _call(client, pdf_block, prompt, DECK_SCHEMA, "Section 1")
+        gap = _incomplete_deck_result(result)
+        if gap is None:
+            return result
+        if attempt == 0:
+            prompt = (
+                f"{DECK_PROMPT}\n\nYour previous response was incomplete ({gap}). Return every "
+                "row listed above — one `section_assessment` row per deck section and one "
+                "`design_recommendations` entry per label, in the given order. Do not omit any."
+            )
+    raise AnalysisError(f"Section 1: model output stayed incomplete after a retry ({gap}).")
 
 
 # --- Reconciling model output with the template's fixed rows -------------------
@@ -189,7 +228,7 @@ def analyze_deck(
     data["date"] = date.today().strftime("%B %d, %Y")
 
     step(1)
-    _apply_deck(data, _call(client, pdf_block, DECK_PROMPT, DECK_SCHEMA, "Section 1"))
+    _apply_deck(data, _call_deck_analysis(client, pdf_block))
 
     problems = validate_report_data(data)
     if problems:
@@ -200,27 +239,36 @@ def analyze_deck(
 
 def run_analysis(
     pdf_path: Path | str,
-    output_path: Path | str,
+    output_base: Path | str,
     company_name: str | None = None,
     progress: Callable[[int, str], None] | None = None,
-) -> Path:
-    """Analyze the deck and write the branded TEN Capital .docx."""
+) -> dict[str, Path]:
+    """Analyze the deck and write the branded TEN Capital report as .docx and .pdf.
+
+    `output_base` is the shared stem (its suffix, if any, is ignored) — the two
+    files are written alongside it as `<stem>.docx` and `<stem>.pdf`.
+    """
     data = analyze_deck(pdf_path, company_name=company_name, progress=progress)
     if progress:
         progress(2, PROGRESS_STEPS[2])
-    return build_report(output_path, data)
+    base = Path(output_base).with_suffix("")
+    return {
+        "docx": build_report(base.with_suffix(".docx"), data),
+        "pdf": build_report_pdf(base.with_suffix(".pdf"), data),
+    }
 
 
-if __name__ == "__main__":  # CLI: python analysis.py deck.pdf [output.docx]
+if __name__ == "__main__":  # CLI: python analysis.py deck.pdf [output-base]
     import sys
 
     if len(sys.argv) < 2:
-        raise SystemExit("usage: python analysis.py <deck.pdf> [output.docx]")
+        raise SystemExit("usage: python analysis.py <deck.pdf> [output-base]")
     deck = Path(sys.argv[1])
     out = Path(sys.argv[2]) if len(sys.argv) > 2 else deck.with_name(
-        f"{deck.stem} - TEN Capital Deck Analysis.docx"
+        f"{deck.stem} - TEN Capital Deck Analysis"
     )
     written = run_analysis(
         deck, out, progress=lambda i, label: print(f"[{i + 1}/{len(PROGRESS_STEPS)}] {label}", flush=True)
     )
-    print(f"Saved {written}")
+    for fmt, path in written.items():
+        print(f"Saved {fmt}: {path}")

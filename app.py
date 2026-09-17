@@ -18,10 +18,19 @@ Environment:
                         HTTP Basic auth (username `ten`, or set APP_USERNAME)
     JOBS_DIR            optional — where uploads and reports are written
     JOB_TTL_MINUTES     optional — how long finished reports stay downloadable
+    RESEND_API_KEY      optional — from resend.com/api-keys; when set, a copy
+                        of every finished report is emailed via Resend
+    REPORT_EMAIL_TO     optional — recipient for that copy (default
+                        info@tencapital.group)
+    REPORT_EMAIL_FROM   optional — Resend "from" address (default uses
+                        Resend's unverified onboarding@resend.dev sender —
+                        replace with an address on a domain verified in your
+                        Resend account for production use)
 """
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import secrets
@@ -40,6 +49,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
 from analysis import MAX_PDF_BYTES, PROGRESS_STEPS, AnalysisError, run_analysis
+from email_report import send_report_email
 
 APP_USERNAME = os.getenv("APP_USERNAME", "ten")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
@@ -50,6 +60,13 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 PUBLIC_DIR = Path(__file__).parent / "public"
+
+_LOGO_PATH = Path(__file__).parent / "TEN_Capital_logo_footer.png"
+LOGO_DATA_URI = (
+    "data:image/png;base64," + base64.b64encode(_LOGO_PATH.read_bytes()).decode()
+    if _LOGO_PATH.exists()
+    else ""
+)
 
 app = FastAPI(title="TEN Capital — Pitch Deck Analyzer")
 # Favicons and other static assets — served without auth so browsers can fetch them.
@@ -88,7 +105,7 @@ class Job:
     step: int = 0
     message: str = "Queued"
     error: str = ""
-    output: Path | None = None
+    outputs: dict[str, Path] = field(default_factory=dict)  # {"docx": Path, "pdf": Path}
     created: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def as_dict(self) -> dict:
@@ -101,7 +118,11 @@ class Job:
             "steps_total": len(PROGRESS_STEPS),
             "message": self.message,
             "error": self.error,
-            "download": f"/jobs/{self.id}/download" if self.state == "done" else None,
+            "downloads": (
+                {fmt: f"/jobs/{self.id}/download/{fmt}" for fmt in self.outputs}
+                if self.state == "done"
+                else None
+            ),
         }
 
 
@@ -137,11 +158,11 @@ def _run_job(job: Job, pdf_path: Path) -> None:
 
     job.state, job.message = "running", PROGRESS_STEPS[0]
     try:
-        output = pdf_path.parent / f"{_safe_name(job.company)} - TEN Capital Deck Analysis.docx"
-        run_analysis(pdf_path, output, company_name=job.company, progress=progress)
-        job.output = output
+        output_base = pdf_path.parent / f"{_safe_name(job.company)} - TEN Capital Deck Analysis"
+        job.outputs = run_analysis(pdf_path, output_base, company_name=job.company, progress=progress)
         job.state, job.step = "done", len(PROGRESS_STEPS)
         job.message = "Report ready"
+        send_report_email(job.company, job.source, job.outputs)
     except AnalysisError as exc:
         job.state, job.error, job.message = "error", str(exc), "Analysis failed"
     except Exception as exc:  # surface a usable message, keep the trace in the logs
@@ -224,16 +245,21 @@ def job_status(job_id: str, _: None = Depends(require_auth)) -> dict:
     return job.as_dict()
 
 
-@app.get("/jobs/{job_id}/download")
-def job_download(job_id: str, _: None = Depends(require_auth)) -> FileResponse:
+_DOWNLOAD_MEDIA_TYPES = {
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "pdf": "application/pdf",
+}
+
+
+@app.get("/jobs/{job_id}/download/{fmt}")
+def job_download(job_id: str, fmt: str, _: None = Depends(require_auth)) -> FileResponse:
+    if fmt not in _DOWNLOAD_MEDIA_TYPES:
+        raise HTTPException(404, "Unknown report format.")
     job = _jobs.get(job_id)
-    if job is None or job.state != "done" or job.output is None or not job.output.exists():
+    output = job.outputs.get(fmt) if job else None
+    if job is None or job.state != "done" or output is None or not output.exists():
         raise HTTPException(404, "No report available for that job.")
-    return FileResponse(
-        job.output,
-        filename=job.output.name,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
+    return FileResponse(output, filename=output.name, media_type=_DOWNLOAD_MEDIA_TYPES[fmt])
 
 
 # --- Front end -----------------------------------------------------------------
@@ -281,16 +307,13 @@ INDEX_HTML = """
   .stage{ position:relative; z-index:1; width:100%; max-width:620px; margin:auto 0; }
 
   /* brand lockup */
-  .brand{ display:flex; align-items:center; gap:12px; margin-bottom:28px; padding-left:4px; }
-  .brand-mark{ width:34px; height:34px; flex-shrink:0; }
-  .brand-word{
-    font-family:'Sora', system-ui, sans-serif; font-weight:800; font-size:15px;
-    letter-spacing:.04em; line-height:1.15; text-transform:uppercase; color:var(--ink-100);
+  .brand{ margin-bottom:24px; }
+  .logo-badge{
+    display:inline-flex; align-items:center; justify-content:center;
+    width:96px; height:52px; border-radius:12px; background:#fff;
+    box-shadow:0 12px 24px -12px rgba(0,0,0,.5);
   }
-  .brand-word span{
-    display:block; font-weight:600; font-size:10px; letter-spacing:.22em;
-    color:var(--ink-500); margin-top:2px;
-  }
+  .logo-badge img{ max-width:76%; max-height:68%; display:block; }
 
   .card{
     background:linear-gradient(180deg, var(--navy-900) 0%, var(--navy-800) 100%);
@@ -353,11 +376,11 @@ INDEX_HTML = """
 
   .dropzone-icon{
     width:38px; height:38px; margin:0 auto 14px; border-radius:10px;
-    background:linear-gradient(135deg, rgba(238,90,78,.16), rgba(243,162,42,.16));
+    background:rgba(255,255,255,.04);
     border:1px solid var(--navy-700); display:flex; align-items:center; justify-content:center;
   }
   .dropzone.has-file .dropzone-icon{
-    background:linear-gradient(135deg, rgba(53,190,187,.22), rgba(53,190,187,.10));
+    background:rgba(53,190,187,.14);
     border-color:rgba(53,190,187,.4);
   }
   .dropzone-icon svg{ width:18px; height:18px; }
@@ -424,13 +447,14 @@ INDEX_HTML = """
   }
   .error-box strong{ color:var(--coral-soft); font-family:'Sora', system-ui, sans-serif; }
   a.download{
-    display:inline-block; margin-top:12px; padding:12px 22px; border-radius:10px;
+    display:inline-block; margin-top:12px; margin-right:10px; padding:12px 22px; border-radius:10px;
     background:linear-gradient(90deg, var(--coral) 0%, var(--coral-soft) 45%, var(--amber) 100%);
     color:#17130E; font-family:'Sora', system-ui, sans-serif; font-weight:700;
     font-size:14px; text-decoration:none;
     box-shadow:0 10px 24px -10px rgba(238,90,78,.45);
   }
   a.download:hover{ filter:brightness(1.06); }
+  a.download:last-child{ margin-right:0; }
 
   .disclosure{
     margin-top:22px; padding-top:18px; border-top:1px solid var(--navy-700);
@@ -464,21 +488,13 @@ INDEX_HTML = """
 <div class="stage">
 
   <div class="brand">
-    <svg class="brand-mark" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-      <path d="M50 6 C64 6 74 16 74 16" stroke="var(--amber)" stroke-width="11" stroke-linecap="round" fill="none"/>
-      <path d="M76 66 C76 82 63 92 63 92" stroke="var(--teal)" stroke-width="11" stroke-linecap="round" fill="none"/>
-      <path d="M24 66 C24 82 37 92 37 92" stroke="var(--coral)" stroke-width="11" stroke-linecap="round" fill="none" transform="rotate(180 50 79)"/>
-      <circle cx="50" cy="20" r="11" fill="var(--amber)"/>
-      <circle cx="78" cy="68" r="11" fill="var(--teal)"/>
-      <circle cx="22" cy="68" r="11" fill="var(--coral)"/>
-    </svg>
-    <div class="brand-word">Ten Capital<span>Network</span></div>
+    <span class="logo-badge"><img src="%%LOGO%%" alt="TEN Capital Network"></span>
   </div>
 
   <div class="card">
     <div class="eyebrow">Deck Analyzer</div>
     <h1>Pitch Deck<span class="arrow">&rarr;</span><span class="to">Investor Review</span></h1>
-    <p class="lede">Upload a deck and get the branded TEN Capital review as a Word document —
+    <p class="lede">Upload a deck and get the branded TEN Capital review as a Word document or PDF —
       section-by-section strengths, weaknesses, and recommendations from Claude.</p>
 
     <form id="form">
@@ -512,7 +528,9 @@ INDEX_HTML = """
 
     <div class="disclosure">
       The deck is processed on the server and deleted as soon as the report is built.
-      Finished reports stay downloadable for a limited time — save the <code>.docx</code> when it appears.
+      Finished reports stay downloadable for a limited time — save the <code>.docx</code> or
+      <code>.pdf</code> when it appears. A copy of every generated report is also emailed to the
+      TEN Capital team.
     </div>
   </div>
 
@@ -622,8 +640,11 @@ async function poll(id) {
   renderSteps(job.step, job.state);
 
   if (job.state === 'done') {
-    result.innerHTML = `<div class="done-box"><strong>Report ready.</strong><br>
-      <a class="download" href="${job.download}">Download .docx</a></div>`;
+    const labels = { docx: 'Download .docx', pdf: 'Download .pdf' };
+    const links = Object.entries(job.downloads || {})
+      .map(([fmt, href]) => `<a class="download" href="${href}">${labels[fmt] || `Download .${fmt}`}</a>`)
+      .join('');
+    result.innerHTML = `<div class="done-box"><strong>Report ready.</strong><br>${links}</div>`;
     finish('Complete', 'Run another analysis');
     return;
   }
@@ -680,4 +701,4 @@ form.addEventListener('submit', async (event) => {
 </html>
 """.replace("%%STEPS%%", str(PROGRESS_STEPS).replace("'", '"')).replace(
     "%%MAX_BYTES%%", str(MAX_PDF_BYTES)
-)
+).replace("%%LOGO%%", LOGO_DATA_URI)
