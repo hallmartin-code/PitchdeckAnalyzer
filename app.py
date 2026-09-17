@@ -37,6 +37,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
 
 from analysis import MAX_PDF_BYTES, PROGRESS_STEPS, AnalysisError, run_analysis
 
@@ -48,7 +49,11 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
+PUBLIC_DIR = Path(__file__).parent / "public"
+
 app = FastAPI(title="TEN Capital — Pitch Deck Analyzer")
+# Favicons and other static assets — served without auth so browsers can fetch them.
+app.mount("/public", StaticFiles(directory=PUBLIC_DIR), name="public")
 _executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
 _basic = HTTPBasic(auto_error=False)
 
@@ -155,6 +160,12 @@ def index(_: None = Depends(require_auth)) -> HTMLResponse:
     return HTMLResponse(INDEX_HTML)
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> FileResponse:
+    # Browsers request /favicon.ico directly, regardless of the <link> tags.
+    return FileResponse(PUBLIC_DIR / "favicon.ico")
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"ok": True, "api_key_configured": bool(os.getenv("ANTHROPIC_API_KEY"))}
@@ -234,6 +245,10 @@ INDEX_HTML = """
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TEN Capital — Pitch Deck Analyzer</title>
+<link rel="icon" href="/public/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/public/favicon-32.png">
+<link rel="icon" type="image/png" sizes="512x512" href="/public/favicon-512.png">
+<link rel="apple-touch-icon" href="/public/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
