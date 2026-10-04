@@ -1,7 +1,8 @@
 # TEN Capital — Pitch Deck Analyzer
 
-Upload a pitch deck PDF → the Claude API reviews the deck section by section →
-a branded TEN Capital `.docx` comes back as a download. Deployable to Railway as a web app.
+Upload a pitch deck PDF, or paste a link to a Google Slides deck → the Claude API reviews the
+deck section by section → a branded TEN Capital `.docx` comes back as a download. Deployable to
+Railway as a web app.
 
 ## Files
 
@@ -9,6 +10,7 @@ a branded TEN Capital `.docx` comes back as a download. Deployable to Railway as
 |---|---|
 | [app.py](app.py) | FastAPI web app — upload page, background jobs, progress polling, download |
 | [analysis.py](analysis.py) | The Claude pipeline; also runs standalone as a CLI |
+| [google_slides.py](google_slides.py) | Turns a pasted Slides link into Google's PDF export of that deck |
 | [schemas.py](schemas.py) | JSON schema for the structured-output call |
 | [report_template.py](report_template.py) | Document structure and formatting — the branded `.docx` builder |
 | [TEMPLATE_STRUCTURE.md](TEMPLATE_STRUCTURE.md) | Human-readable spec of the document and its fields |
@@ -91,6 +93,9 @@ and every upload spends your API credit.
   as base64.
 - **Deck size limit is 32 MB**, imposed by the API. Larger decks are rejected at upload with a
   clear message.
+- **Google Slides links must be viewable by anyone with the link** — the app downloads Google's
+  own PDF export over the public export URL, with no Google sign-in of its own. A private deck
+  gets a message asking the user to open link sharing or upload a PDF instead.
 - The browser tab must stay open — it's what polls for progress and fetches the file.
 
 ## Changing the analysis

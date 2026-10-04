@@ -1,8 +1,8 @@
 """
 TEN Capital — Pitch Deck Analyzer (web app)
 
-Upload a pitch deck PDF, the Claude API runs the deck analysis, and the branded
-TEN Capital .docx comes back as a download.
+Upload a pitch deck PDF (or paste a link to a Google Slides deck), the Claude API
+runs the deck analysis, and the branded TEN Capital .docx comes back as a download.
 
 Analysis takes a few minutes, so uploads start a background job and the page
 polls for progress rather than holding the request open.
@@ -47,8 +47,10 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, sta
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from analysis import MAX_PDF_BYTES, PROGRESS_STEPS, AnalysisError, run_analysis
+from google_slides import SlidesError, fetch_slides_pdf
 from email_report import send_report_email
 
 APP_USERNAME = os.getenv("APP_USERNAME", "ten")
@@ -195,11 +197,22 @@ def healthz() -> dict:
 @app.post("/analyze")
 async def analyze(
     _: None = Depends(require_auth),
-    deck: UploadFile = File(...),
+    deck: UploadFile | None = File(None),
+    slides_url: str = Form(""),
     company: str = Form(""),
 ) -> JSONResponse:
-    if not (deck.filename or "").lower().endswith(".pdf"):
-        raise HTTPException(400, "Upload a PDF pitch deck.")
+    """Start a job from either an uploaded PDF or a Google Slides link."""
+    uploaded = deck if deck is not None and deck.filename else None
+    slides_url = slides_url.strip()
+
+    if uploaded and slides_url:
+        raise HTTPException(400, "Send either a PDF or a Google Slides link, not both.")
+    if not uploaded and not slides_url:
+        raise HTTPException(400, "Upload a PDF pitch deck or paste a Google Slides link.")
+    if uploaded and not (uploaded.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(
+            400, "Uploads must be PDFs. For a Google Slides deck, paste its link instead."
+        )
     if not os.getenv("ANTHROPIC_API_KEY"):
         raise HTTPException(
             503,
@@ -211,20 +224,33 @@ async def analyze(
     job_id = uuid.uuid4().hex[:12]
     folder = JOBS_DIR / job_id
     folder.mkdir(parents=True, exist_ok=True)
-    pdf_path = folder / _safe_name(Path(deck.filename).name)
 
-    size = 0
-    with pdf_path.open("wb") as handle:
-        while chunk := await deck.read(1024 * 1024):
-            size += len(chunk)
-            if size > MAX_PDF_BYTES:
-                handle.close()
-                pdf_path.unlink(missing_ok=True)
-                folder.rmdir()
-                raise HTTPException(
-                    413, f"Deck exceeds the {MAX_PDF_BYTES // 1024 // 1024} MB limit the API accepts."
-                )
-            handle.write(chunk)
+    if uploaded:
+        pdf_path = folder / _safe_name(Path(uploaded.filename).name)
+        size = 0
+        with pdf_path.open("wb") as handle:
+            while chunk := await uploaded.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_PDF_BYTES:
+                    handle.close()
+                    pdf_path.unlink(missing_ok=True)
+                    folder.rmdir()
+                    raise HTTPException(
+                        413,
+                        f"Deck exceeds the {MAX_PDF_BYTES // 1024 // 1024} MB limit the API accepts.",
+                    )
+                handle.write(chunk)
+    else:
+        # Google exports the deck for us; the download blocks, so keep it off the loop.
+        pdf_path = folder / "slides.pdf"
+        try:
+            name = await run_in_threadpool(fetch_slides_pdf, slides_url, pdf_path, MAX_PDF_BYTES)
+        except SlidesError as exc:
+            folder.rmdir()
+            raise HTTPException(400, str(exc)) from exc
+        named = folder / _safe_name(name)
+        if named != pdf_path:
+            pdf_path = pdf_path.rename(named)
 
     job = Job(
         id=job_id,
@@ -359,8 +385,27 @@ INDEX_HTML = """
     background:rgba(255,255,255,.02); border:1px solid var(--navy-700); color:var(--ink-100);
     transition:border-color .18s ease, background .18s ease;
   }
-  input[type=text]::placeholder{ color:var(--ink-600); }
-  input[type=text]:focus{ outline:none; border-color:var(--teal); background:rgba(53,190,187,.04); }
+  input[type=text]::placeholder, input[type=url]::placeholder{ color:var(--ink-600); }
+  input[type=text]:focus, input[type=url]:focus{
+    outline:none; border-color:var(--teal); background:rgba(53,190,187,.04);
+  }
+  input[type=url]{
+    width:100%; padding:12px 14px; border-radius:10px; font:inherit;
+    background:rgba(255,255,255,.02); border:1px solid var(--navy-700); color:var(--ink-100);
+    transition:border-color .18s ease, background .18s ease;
+  }
+  input:disabled{ opacity:.45; cursor:not-allowed; }
+
+  /* "or" divider between the two ways to hand over a deck */
+  .or{
+    display:flex; align-items:center; gap:12px; margin:16px 0;
+    font-family:'JetBrains Mono', ui-monospace, monospace; font-size:10.5px;
+    letter-spacing:.14em; text-transform:uppercase; color:var(--ink-600);
+  }
+  .or::before, .or::after{ content:""; flex:1; height:1px; background:var(--navy-700); }
+  .hint{
+    margin-top:8px; font-size:11.5px; line-height:1.5; color:var(--ink-600);
+  }
 
   /* dropzone */
   .dropzone{
@@ -494,8 +539,9 @@ INDEX_HTML = """
   <div class="card">
     <div class="eyebrow">Deck Analyzer</div>
     <h1>Pitch Deck<span class="arrow">&rarr;</span><span class="to">Investor Review</span></h1>
-    <p class="lede">Upload a deck and get the branded TEN Capital review as a Word document or PDF —
-      section-by-section strengths, weaknesses, and recommendations from Claude.</p>
+    <p class="lede">Upload a PDF deck or paste a Google Slides link, and get the branded TEN Capital
+      review as a Word document or PDF — section-by-section strengths, weaknesses, and
+      recommendations from Claude.</p>
 
     <form id="form">
       <div class="field">
@@ -513,8 +559,18 @@ INDEX_HTML = """
         </div>
         <div class="dropzone-title" id="dz-title">Click or drop a deck here</div>
         <div class="dropzone-sub" id="dz-sub"><b>.pdf</b> &nbsp;&middot;&nbsp; up to 32&nbsp;MB</div>
-        <input class="file-input" type="file" id="deck" name="deck" accept="application/pdf,.pdf" required>
+        <input class="file-input" type="file" id="deck" name="deck" accept="application/pdf,.pdf">
       </label>
+
+      <div class="or">or</div>
+
+      <div class="field">
+        <label class="field-label" for="slides_url">Google Slides link</label>
+        <input type="url" id="slides_url" name="slides_url" inputmode="url"
+               placeholder="https://docs.google.com/presentation/d/...">
+        <p class="hint">Share the deck as <b>Anyone with the link &middot; Viewer</b> first — we fetch
+          Google's own PDF export of it.</p>
+      </div>
 
       <button class="cta" type="submit" id="go">Run deck analysis</button>
     </form>
@@ -551,6 +607,7 @@ const deck = document.getElementById('deck');
 const dropzone = document.getElementById('dropzone');
 const dzTitle = document.getElementById('dz-title');
 const dzSub = document.getElementById('dz-sub');
+const slidesUrl = document.getElementById('slides_url');
 const phase = document.getElementById('phase');
 const clock = document.getElementById('clock');
 
@@ -563,7 +620,19 @@ function escapeHtml(text) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
-// --- file selection -----------------------------------------------------------
+// --- deck source: an upload or a Slides link, never both ----------------------
+
+function isSlidesLink(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch (err) {
+    return false;
+  }
+  const host = url.hostname.toLowerCase().replace('www.', '');
+  return host === 'docs.google.com'
+    && url.pathname.toLowerCase().startsWith('/presentation/d/');
+}
 
 function showFile() {
   const file = deck.files && deck.files[0];
@@ -571,14 +640,27 @@ function showFile() {
     dropzone.classList.remove('has-file');
     dzTitle.textContent = IDLE_TITLE;
     dzSub.innerHTML = IDLE_SUB;
+    syncSources();
     return;
   }
   dropzone.classList.add('has-file');
   dzTitle.textContent = file.name;
   dzSub.innerHTML = `<b>${(file.size / 1048576).toFixed(1)} MB</b> &nbsp;&middot;&nbsp; ready to analyze`;
+  syncSources();
+}
+
+// Grey out whichever source is not in use, so the choice reads as either/or.
+function syncSources() {
+  const hasFile = !!(deck.files && deck.files[0]);
+  const hasLink = slidesUrl.value.trim() !== '';
+  slidesUrl.disabled = hasFile;
+  deck.disabled = hasLink;
+  dropzone.style.opacity = hasLink ? '.45' : '';
+  dropzone.style.pointerEvents = hasLink ? 'none' : '';
 }
 
 deck.addEventListener('change', showFile);
+slidesUrl.addEventListener('input', syncSources);
 
 ['dragenter', 'dragover'].forEach((type) =>
   dropzone.addEventListener(type, (event) => {
@@ -664,20 +746,28 @@ function showError(err, heading) {
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   const file = deck.files && deck.files[0];
+  const link = slidesUrl.value.trim();
   result.innerHTML = '';
 
-  if (!file) { showError(new Error('Choose a PDF pitch deck first.')); return; }
-  if (!file.name.toLowerCase().endsWith('.pdf')) {
-    showError(new Error('The deck must be a PDF.'));
+  if (!file && !link) {
+    showError(new Error('Upload a PDF deck or paste a Google Slides link first.'));
     return;
   }
-  if (file.size > MAX_BYTES) {
+  if (file && !file.name.toLowerCase().endsWith('.pdf')) {
+    showError(new Error('Uploads must be PDFs — for a Google Slides deck, paste its link instead.'));
+    return;
+  }
+  if (file && file.size > MAX_BYTES) {
     showError(new Error(`That deck is ${(file.size / 1048576).toFixed(1)} MB — the limit is ${MAX_BYTES / 1048576} MB.`));
+    return;
+  }
+  if (!file && !isSlidesLink(link)) {
+    showError(new Error('That does not look like a Google Slides link. It should start with https://docs.google.com/presentation/'));
     return;
   }
 
   go.disabled = true;
-  go.textContent = 'Analyzing…';
+  go.textContent = file ? 'Analyzing…' : 'Fetching deck…';
   phase.textContent = 'Analyzing';
   clock.textContent = '0:00';
   statusBox.classList.add('on');
@@ -691,6 +781,7 @@ form.addEventListener('submit', async (event) => {
       throw new Error(detail.detail || 'Upload failed.');
     }
     const job = await res.json();
+    go.textContent = 'Analyzing…';
     poll(job.id).catch(showError);
   } catch (err) {
     showError(err, 'Upload failed.');
