@@ -1,8 +1,8 @@
 # TEN Capital — Pitch Deck Analyzer
 
-Upload a pitch deck PDF, or paste a link to a Google Slides deck → the Claude API reviews the
-deck section by section → a branded TEN Capital `.docx` comes back as a download. Deployable to
-Railway as a web app.
+Upload a pitch deck as PDF or PowerPoint, or paste a link to a Google Slides deck → the Claude
+API reviews the deck section by section → a branded TEN Capital `.docx` comes back as a download.
+Deployable to Railway as a web app.
 
 ## Files
 
@@ -11,6 +11,8 @@ Railway as a web app.
 | [app.py](app.py) | FastAPI web app — upload page, background jobs, progress polling, download |
 | [analysis.py](analysis.py) | The Claude pipeline; also runs standalone as a CLI |
 | [google_slides.py](google_slides.py) | Turns a pasted Slides link into Google's PDF export of that deck |
+| [powerpoint.py](powerpoint.py) | Renders an uploaded `.pptx`/`.ppt` to PDF with headless LibreOffice |
+| `nixpacks.toml` | Puts LibreOffice in the Railway image — without it, PowerPoint uploads are refused |
 | [schemas.py](schemas.py) | JSON schema for the structured-output call |
 | [report_template.py](report_template.py) | Document structure and formatting — the branded `.docx` builder |
 | [TEMPLATE_STRUCTURE.md](TEMPLATE_STRUCTURE.md) | Human-readable spec of the document and its fields |
@@ -58,8 +60,9 @@ python report_template.py        # writes _template_preview.docx
 ## Deploy to Railway
 
 1. **Push this folder to a GitHub repo.** It needs `app.py`, `analysis.py`, `schemas.py`,
-   `report_template.py`, `pdf_template.py`, `email_report.py`, `requirements.txt`, `Procfile`,
-   `railway.json`, `.python-version`, and `TEN_Capital_logo_footer.png`.
+   `report_template.py`, `pdf_template.py`, `email_report.py`, `google_slides.py`,
+   `powerpoint.py`, `requirements.txt`, `Procfile`, `railway.json`, `nixpacks.toml`,
+   `.python-version`, and `TEN_Capital_logo_footer.png`.
 2. **Railway → New Project → Deploy from GitHub repo**, and pick it. Nixpacks detects Python from
    `requirements.txt`; `railway.json` supplies the start command and the `/healthz` health check.
 3. **Variables** (service → Variables):
@@ -72,6 +75,7 @@ python report_template.py        # writes _template_preview.docx
    | `MAX_CONCURRENT_JOBS` | no | Simultaneous analyses (default `2`) |
    | `JOB_TTL_MINUTES` | no | How long finished reports stay downloadable (default `180`) |
    | `JOBS_DIR` | no | Where uploads and reports are written (default: system temp) |
+   | `SOFFICE_BIN` | no | Path to the LibreOffice binary, if it is not on `PATH` |
    | `RESEND_API_KEY` | no | From resend.com/api-keys; when set, emails a copy of every finished report |
    | `REPORT_EMAIL_TO` | no | Recipient for that copy (default `info@tencapital.group`) |
    | `REPORT_EMAIL_FROM` | no | Resend "from" address — must be on a domain verified in your Resend account for production (default uses Resend's unverified `onboarding@resend.dev` sender) |
@@ -93,6 +97,11 @@ and every upload spends your API credit.
   as base64.
 - **Deck size limit is 32 MB**, imposed by the API. Larger decks are rejected at upload with a
   clear message.
+- **PowerPoint decks are rendered by LibreOffice**, installed from `nixpacks.toml`. It adds build
+  time and image size, and conversion of a heavy deck takes roughly 10–60 seconds before the
+  analysis starts. If LibreOffice is missing, `.pptx` uploads are refused at upload with a message
+  saying so — the rest of the app is unaffected. Fonts missing from the image cause text to
+  reflow, which is why `fonts-liberation` ships with it.
 - **Google Slides links must be viewable by anyone with the link** — the app downloads Google's
   own PDF export over the public export URL, with no Google sign-in of its own. A private deck
   gets a message asking the user to open link sharing or upload a PDF instead.

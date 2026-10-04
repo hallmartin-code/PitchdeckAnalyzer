@@ -1,8 +1,9 @@
 """
 TEN Capital — Pitch Deck Analyzer (web app)
 
-Upload a pitch deck PDF (or paste a link to a Google Slides deck), the Claude API
-runs the deck analysis, and the branded TEN Capital .docx comes back as a download.
+Upload a pitch deck as PDF or PowerPoint (or paste a link to a Google Slides deck),
+the Claude API runs the deck analysis, and the branded TEN Capital .docx comes back
+as a download. PowerPoint decks are rendered to PDF with LibreOffice first.
 
 Analysis takes a few minutes, so uploads start a background job and the page
 polls for progress rather than holding the request open.
@@ -34,6 +35,7 @@ import base64
 import os
 import re
 import secrets
+import shutil
 import tempfile
 import threading
 import traceback
@@ -51,6 +53,7 @@ from starlette.concurrency import run_in_threadpool
 
 from analysis import MAX_PDF_BYTES, PROGRESS_STEPS, AnalysisError, run_analysis
 from google_slides import SlidesError, fetch_slides_pdf
+from powerpoint import ConversionError, convert_to_pdf, is_powerpoint, soffice_available
 from email_report import send_report_email
 
 APP_USERNAME = os.getenv("APP_USERNAME", "ten")
@@ -154,25 +157,37 @@ def _safe_name(name: str) -> str:
     return re.sub(r"\s+", " ", cleaned)[:80] or "Pitch Deck"
 
 
-def _run_job(job: Job, pdf_path: Path) -> None:
+def _run_job(job: Job, deck_path: Path) -> None:
     def progress(index: int, label: str) -> None:
         job.step, job.message = index, label
 
     job.state, job.message = "running", PROGRESS_STEPS[0]
+    pdf_path = deck_path
     try:
-        output_base = pdf_path.parent / f"{_safe_name(job.company)} - TEN Capital Deck Analysis"
+        if is_powerpoint(deck_path.name):
+            # Rendering can take a minute, so it happens here rather than holding
+            # the upload request open; the page shows it as part of step one.
+            job.message = "Converting the deck"
+            # Rendered into its own folder so it cannot collide with the report files.
+            pdf_path = convert_to_pdf(deck_path, deck_path.parent / "render")
+            job.message = PROGRESS_STEPS[0]
+
+        # Reports go in the job folder, never beside a converted deck — that folder is deleted below.
+        output_base = deck_path.parent / f"{_safe_name(job.company)} - TEN Capital Deck Analysis"
         job.outputs = run_analysis(pdf_path, output_base, company_name=job.company, progress=progress)
         job.state, job.step = "done", len(PROGRESS_STEPS)
         job.message = "Report ready"
         send_report_email(job.company, job.source, job.outputs)
-    except AnalysisError as exc:
+    except (AnalysisError, ConversionError) as exc:
         job.state, job.error, job.message = "error", str(exc), "Analysis failed"
     except Exception as exc:  # surface a usable message, keep the trace in the logs
         traceback.print_exc()
         job.state, job.message = "error", "Analysis failed"
         job.error = f"{type(exc).__name__}: {exc}"
-    finally:
-        pdf_path.unlink(missing_ok=True)  # the deck is not ours to keep
+    finally:  # neither the deck nor anything rendered from it is ours to keep
+        deck_path.unlink(missing_ok=True)
+        if pdf_path != deck_path:
+            shutil.rmtree(pdf_path.parent, ignore_errors=True)
 
 
 # --- Routes --------------------------------------------------------------------
@@ -201,17 +216,26 @@ async def analyze(
     slides_url: str = Form(""),
     company: str = Form(""),
 ) -> JSONResponse:
-    """Start a job from either an uploaded PDF or a Google Slides link."""
+    """Start a job from an uploaded PDF or PowerPoint deck, or a Google Slides link."""
     uploaded = deck if deck is not None and deck.filename else None
     slides_url = slides_url.strip()
 
     if uploaded and slides_url:
-        raise HTTPException(400, "Send either a PDF or a Google Slides link, not both.")
+        raise HTTPException(400, "Send either a deck file or a Google Slides link, not both.")
     if not uploaded and not slides_url:
-        raise HTTPException(400, "Upload a PDF pitch deck or paste a Google Slides link.")
-    if uploaded and not (uploaded.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Upload a deck file or paste a Google Slides link.")
+    name = (uploaded.filename or "") if uploaded else ""
+    if uploaded and not (name.lower().endswith(".pdf") or is_powerpoint(name)):
         raise HTTPException(
-            400, "Uploads must be PDFs. For a Google Slides deck, paste its link instead."
+            400,
+            "Uploads must be a .pdf, .pptx, or .ppt file. For a Google Slides deck, "
+            "paste its link instead.",
+        )
+    if uploaded and is_powerpoint(name) and not soffice_available():
+        raise HTTPException(
+            503,
+            "PowerPoint conversion is not available on this server (LibreOffice is not "
+            "installed). Save the deck as a PDF and upload that instead.",
         )
     if not os.getenv("ANTHROPIC_API_KEY"):
         raise HTTPException(
@@ -226,14 +250,14 @@ async def analyze(
     folder.mkdir(parents=True, exist_ok=True)
 
     if uploaded:
-        pdf_path = folder / _safe_name(Path(uploaded.filename).name)
+        deck_path = folder / _safe_name(Path(uploaded.filename).name)
         size = 0
-        with pdf_path.open("wb") as handle:
+        with deck_path.open("wb") as handle:
             while chunk := await uploaded.read(1024 * 1024):
                 size += len(chunk)
                 if size > MAX_PDF_BYTES:
                     handle.close()
-                    pdf_path.unlink(missing_ok=True)
+                    deck_path.unlink(missing_ok=True)
                     folder.rmdir()
                     raise HTTPException(
                         413,
@@ -242,24 +266,24 @@ async def analyze(
                 handle.write(chunk)
     else:
         # Google exports the deck for us; the download blocks, so keep it off the loop.
-        pdf_path = folder / "slides.pdf"
+        deck_path = folder / "slides.pdf"
         try:
-            name = await run_in_threadpool(fetch_slides_pdf, slides_url, pdf_path, MAX_PDF_BYTES)
+            name = await run_in_threadpool(fetch_slides_pdf, slides_url, deck_path, MAX_PDF_BYTES)
         except SlidesError as exc:
             folder.rmdir()
             raise HTTPException(400, str(exc)) from exc
         named = folder / _safe_name(name)
-        if named != pdf_path:
-            pdf_path = pdf_path.rename(named)
+        if named != deck_path:
+            deck_path = deck_path.rename(named)
 
     job = Job(
         id=job_id,
-        company=(company.strip() or pdf_path.stem),
-        source=pdf_path.name,
+        company=(company.strip() or deck_path.stem),
+        source=deck_path.name,
     )
     with _jobs_lock:
         _jobs[job_id] = job
-    _executor.submit(_run_job, job, pdf_path)
+    _executor.submit(_run_job, job, deck_path)
     return JSONResponse(job.as_dict(), status_code=202)
 
 
@@ -539,9 +563,9 @@ INDEX_HTML = """
   <div class="card">
     <div class="eyebrow">Deck Analyzer</div>
     <h1>Pitch Deck<span class="arrow">&rarr;</span><span class="to">Investor Review</span></h1>
-    <p class="lede">Upload a PDF deck or paste a Google Slides link, and get the branded TEN Capital
-      review as a Word document or PDF — section-by-section strengths, weaknesses, and
-      recommendations from Claude.</p>
+    <p class="lede">Upload a PDF or PowerPoint deck, or paste a Google Slides link, and get the
+      branded TEN Capital review as a Word document or PDF — section-by-section strengths,
+      weaknesses, and recommendations from Claude.</p>
 
     <form id="form">
       <div class="field">
@@ -558,8 +582,9 @@ INDEX_HTML = """
           </svg>
         </div>
         <div class="dropzone-title" id="dz-title">Click or drop a deck here</div>
-        <div class="dropzone-sub" id="dz-sub"><b>.pdf</b> &nbsp;&middot;&nbsp; up to 32&nbsp;MB</div>
-        <input class="file-input" type="file" id="deck" name="deck" accept="application/pdf,.pdf">
+        <div class="dropzone-sub" id="dz-sub"><b>.pdf .pptx .ppt</b> &nbsp;&middot;&nbsp; up to 32&nbsp;MB</div>
+        <input class="file-input" type="file" id="deck" name="deck"
+               accept=".pdf,.pptx,.ppt,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.ms-powerpoint">
       </label>
 
       <div class="or">or</div>
@@ -621,6 +646,8 @@ function escapeHtml(text) {
 }
 
 // --- deck source: an upload or a Slides link, never both ----------------------
+
+const DECK_SUFFIXES = ['.pdf', '.pptx', '.ppt'];
 
 function isSlidesLink(value) {
   let url;
@@ -750,11 +777,11 @@ form.addEventListener('submit', async (event) => {
   result.innerHTML = '';
 
   if (!file && !link) {
-    showError(new Error('Upload a PDF deck or paste a Google Slides link first.'));
+    showError(new Error('Upload a deck file or paste a Google Slides link first.'));
     return;
   }
-  if (file && !file.name.toLowerCase().endsWith('.pdf')) {
-    showError(new Error('Uploads must be PDFs — for a Google Slides deck, paste its link instead.'));
+  if (file && !DECK_SUFFIXES.some((suffix) => file.name.toLowerCase().endsWith(suffix))) {
+    showError(new Error('Uploads must be a .pdf, .pptx, or .ppt file — for a Google Slides deck, paste its link instead.'));
     return;
   }
   if (file && file.size > MAX_BYTES) {

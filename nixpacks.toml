@@ -1,0 +1,20 @@
+# Railway build config.
+#
+# PowerPoint decks are rendered to PDF by LibreOffice, which is a system binary
+# rather than a Python package — without this the app still runs, but .pptx
+# uploads are refused with a message saying conversion is unavailable.
+#
+# `libreoffice-impress` is the Impress-only package (much smaller than the full
+# suite); the font packages matter because a deck rendered without its fonts
+# reflows, and the report grades layout and design.
+
+[phases.setup]
+# "..." keeps whatever packages Nixpacks' Python provider adds on its own —
+# without it, this list would replace them.
+aptPkgs = [
+  "...",
+  "libreoffice-impress",
+  "libreoffice-core",
+  "fonts-liberation",
+  "fonts-dejavu-core",
+]
