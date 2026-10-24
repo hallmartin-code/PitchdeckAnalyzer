@@ -11,12 +11,16 @@ polls for progress rather than holding the request open.
 Run locally:
     pip install -r requirements.txt
     $env:ANTHROPIC_API_KEY = "sk-ant-..."      # PowerShell
+    $env:ALLOW_NO_AUTH = "1"                   # local only; no password prompt
     uvicorn app:app --reload
 
 Environment:
     ANTHROPIC_API_KEY   required — from console.anthropic.com/settings/keys
-    APP_PASSWORD        optional — when set, the whole app sits behind
-                        HTTP Basic auth (username `ten`, or set APP_USERNAME)
+    APP_PASSWORD        required — puts the whole app behind HTTP Basic auth
+                        (username `ten`, or set APP_USERNAME). Without it the
+                        app refuses to start, because an open deployment lets
+                        anyone with the URL spend the API key
+    ALLOW_NO_AUTH       optional — set to 1 to run locally without a password
     JOBS_DIR            optional — where uploads and reports are written
     JOB_TTL_MINUTES     optional — how long finished reports stay downloadable
     RESEND_API_KEY      optional — from resend.com/api-keys; when set, a copy
@@ -63,6 +67,24 @@ JOB_TTL = timedelta(minutes=int(os.getenv("JOB_TTL_MINUTES", "180")))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+# An app left open spends ANTHROPIC_API_KEY for whoever finds the URL, so a
+# missing password stops the app rather than quietly serving the world. Local
+# runs opt out explicitly with ALLOW_NO_AUTH=1.
+ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "").strip().lower() in {"1", "true", "yes"}
+if not APP_PASSWORD and not ALLOW_NO_AUTH:
+    raise RuntimeError(
+        "APP_PASSWORD is not set, so the app would be open to anyone with the URL and "
+        "every analysis would spend your Anthropic API key. Set APP_PASSWORD in the Railway "
+        "service variables (Settings → Variables), or set ALLOW_NO_AUTH=1 to run without "
+        "auth locally."
+    )
+if APP_PASSWORD and len(APP_PASSWORD) < 12:
+    print(
+        f"WARNING: APP_PASSWORD is {len(APP_PASSWORD)} characters. This is the only thing "
+        "between the public internet and your API key — use 16 or more.",
+        flush=True,
+    )
 
 PUBLIC_DIR = Path(__file__).parent / "public"
 
@@ -151,6 +173,18 @@ def _sweep_expired() -> None:
         folder.rmdir()
 
 
+_SECRET_RE = re.compile(r"(sk-ant-|re_)[A-Za-z0-9_-]{8,}")
+
+
+def _scrub(text: str) -> str:
+    """Strip anything key-shaped out of text that reaches the browser.
+
+    Nothing is known to put a key in an exception message — this is here so that
+    a future library change cannot turn an error page into a key disclosure.
+    """
+    return _SECRET_RE.sub(r"\1[redacted]", text)
+
+
 def _safe_name(name: str) -> str:
     """A filename that survives Windows, Linux, and Content-Disposition."""
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", name).strip(" .")
@@ -179,11 +213,11 @@ def _run_job(job: Job, deck_path: Path) -> None:
         job.message = "Report ready"
         send_report_email(job.company, job.source, job.outputs)
     except (AnalysisError, ConversionError) as exc:
-        job.state, job.error, job.message = "error", str(exc), "Analysis failed"
+        job.state, job.error, job.message = "error", _scrub(str(exc)), "Analysis failed"
     except Exception as exc:  # surface a usable message, keep the trace in the logs
         traceback.print_exc()
         job.state, job.message = "error", "Analysis failed"
-        job.error = f"{type(exc).__name__}: {exc}"
+        job.error = _scrub(f"{type(exc).__name__}: {exc}")
     finally:  # neither the deck nor anything rendered from it is ours to keep
         deck_path.unlink(missing_ok=True)
         if pdf_path != deck_path:
@@ -206,7 +240,8 @@ def favicon() -> FileResponse:
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"ok": True, "api_key_configured": bool(os.getenv("ANTHROPIC_API_KEY"))}
+    # Unauthenticated (Railway polls it), so it says nothing about how the app is configured.
+    return {"ok": True}
 
 
 @app.post("/analyze")

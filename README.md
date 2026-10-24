@@ -40,6 +40,7 @@ structure.
 ```powershell
 pip install -r requirements.txt
 $env:ANTHROPIC_API_KEY = "sk-ant-..."     # from console.anthropic.com/settings/keys
+$env:ALLOW_NO_AUTH = "1"                  # local only — skips the password gate
 uvicorn app:app --reload
 ```
 
@@ -70,20 +71,30 @@ python report_template.py        # writes _template_preview.docx
    | Variable | Required | Purpose |
    |---|---|---|
    | `ANTHROPIC_API_KEY` | yes | Your key from the Claude console |
-   | `APP_PASSWORD` | strongly recommended | Puts the whole app behind HTTP Basic auth |
+   | `APP_PASSWORD` | **yes** | Puts the whole app behind HTTP Basic auth. The app refuses to start without it |
    | `APP_USERNAME` | no | Basic-auth username (default `ten`) |
    | `MAX_CONCURRENT_JOBS` | no | Simultaneous analyses (default `2`) |
    | `JOB_TTL_MINUTES` | no | How long finished reports stay downloadable (default `180`) |
    | `JOBS_DIR` | no | Where uploads and reports are written (default: system temp) |
    | `SOFFICE_BIN` | no | Path to the LibreOffice binary, if it is not on `PATH` |
+   | `ALLOW_NO_AUTH` | no | Set to `1` to run without a password — local development only |
    | `RESEND_API_KEY` | no | From resend.com/api-keys; when set, emails a copy of every finished report |
    | `REPORT_EMAIL_TO` | no | Recipient for that copy (default `info@tencapital.group`) |
    | `REPORT_EMAIL_FROM` | no | Resend "from" address — must be on a domain verified in your Resend account for production (default uses Resend's unverified `onboarding@resend.dev` sender) |
 
 4. **Settings → Networking → Generate Domain** to get the public URL.
 
-Set `APP_PASSWORD` before sharing the URL. Without it the app is open to anyone who finds it,
-and every upload spends your API credit.
+`APP_PASSWORD` is what stands between the public internet and your Anthropic key — every upload
+spends your API credit. The app refuses to start without it, so a deploy that is missing the
+variable fails its health check instead of coming up open to the world.
+
+### If the API key is ever exposed
+
+Rotate it; do not try to clean it up in place. In the Claude console under **Settings → API keys**,
+create a new key, paste it into the Railway variable, wait for the redeploy to go healthy, then
+**revoke the old key** in the console. Revoking first takes the app down until the new key lands.
+Anthropic keys cannot be restricted by IP or referrer, so revocation is the only thing that
+actually stops a leaked key.
 
 ### Deployment notes
 
